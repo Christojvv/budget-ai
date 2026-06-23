@@ -1,4 +1,10 @@
 import { useState, useRef, useEffect } from "react";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  "https://hcbawiywefgzhjhfjwee.supabase.co",
+  "sb_publishable_t39og82lzf6d0_7visdAhw_qoPD4jLf"
+);
 
 const formatZAR = (value) =>
   new Intl.NumberFormat("en-ZA", { style: "currency", currency: "ZAR" }).format(Number(value || 0));
@@ -11,8 +17,15 @@ const load = (key, fallback) => {
 const save = (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} };
 
 export default function App() {
-  const [tab, setTab] = useState("accounts");
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authMode, setAuthMode] = useState("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authMsg, setAuthMsg] = useState("");
 
+  const [tab, setTab] = useState("accounts");
   const [accounts, setAccounts] = useState(() => load("accounts", [
     { id: 1, name: "Primary Account", balance: 12450.75 },
     { id: 2, name: "Savings Account", balance: 45000 },
@@ -23,34 +36,84 @@ export default function App() {
   const [hoverId, setHoverId] = useState(null);
   const [showAddAccount, setShowAddAccount] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState(null);
   const [newName, setNewName] = useState("");
   const [editingId, setEditingId] = useState(null);
   const [tempValue, setTempValue] = useState("");
 
-  const [categories, setCategories] = useState(() => load("categories",
-    DEFAULT_CATEGORIES.map((name, i) => ({ id: i + 1, name, budget: 0 }))
-  ));
-  const [weeklyBudget, setWeeklyBudget] = useState(() => load("weeklyBudget", 0));
-  const [monthlyBudget, setMonthlyBudget] = useState(() => load("monthlyBudget", 0));
-  const [transactions, setTransactions] = useState(() => load("transactions", []));
-  const [nextTxId, setNextTxId] = useState(() => load("nextTxId", 1));
+  const [categories, setCategories] = useState([]);
+  const [weeklyBudget, setWeeklyBudget] = useState(0);
+  const [monthlyBudget, setMonthlyBudget] = useState(0);
+  const [transactions, setTransactions] = useState([]);
   const [newCatName, setNewCatName] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState("");
   const [pendingTxs, setPendingTxs] = useState([]);
   const [showPending, setShowPending] = useState(false);
   const [budgetView, setBudgetView] = useState("overview");
+  const [dbLoading, setDbLoading] = useState(false);
   const fileRef = useRef();
 
-  // Persist to localStorage on change
+  // Auth listener
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setAuthLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // Load user data from Supabase when logged in
+  useEffect(() => {
+    if (!session) return;
+    loadUserData();
+  }, [session]);
+
+  const loadUserData = async () => {
+    setDbLoading(true);
+    const uid = session.user.id;
+
+    const [{ data: cats }, { data: budgets }, { data: txs }] = await Promise.all([
+      supabase.from("categories").select("*").eq("user_id", uid),
+      supabase.from("budgets").select("*").eq("user_id", uid).single(),
+      supabase.from("transactions").select("*").eq("user_id", uid).order("created_at", { ascending: false }),
+    ]);
+
+    if (cats && cats.length > 0) {
+      setCategories(cats.map((c) => ({ id: c.id, name: c.name, budget: c.budget })));
+    } else {
+      const defaults = DEFAULT_CATEGORIES.map((name, i) => ({ id: i + 1, name, budget: 0 }));
+      setCategories(defaults);
+      await Promise.all(defaults.map((c) =>
+        supabase.from("categories").insert({ id: c.id, name: c.name, budget: c.budget, user_id: uid })
+      ));
+    }
+
+    if (budgets) {
+      setWeeklyBudget(budgets.weekly || 0);
+      setMonthlyBudget(budgets.monthly || 0);
+    }
+
+    if (txs) {
+      setTransactions(txs.map((t) => ({ id: t.id, description: t.description, amount: t.amount, date: t.date, categoryId: t.category_id })));
+    }
+
+    setDbLoading(false);
+  };
+
+  // Persist accounts locally
   useEffect(() => save("accounts", accounts), [accounts]);
   useEffect(() => save("nextAccId", nextAccId), [nextAccId]);
-  useEffect(() => save("categories", categories), [categories]);
-  useEffect(() => save("weeklyBudget", weeklyBudget), [weeklyBudget]);
-  useEffect(() => save("monthlyBudget", monthlyBudget), [monthlyBudget]);
-  useEffect(() => save("transactions", transactions), [transactions]);
-  useEffect(() => save("nextTxId", nextTxId), [nextTxId]);
+
+  // Sync budgets to Supabase
+  const syncBudgets = async (weekly, monthly) => {
+    if (!session) return;
+    await supabase.from("budgets").upsert({ user_id: session.user.id, weekly, monthly });
+  };
 
   const total = accounts.reduce((sum, a) => sum + a.balance, 0);
   const weekStart = (() => { const d = new Date(); d.setDate(d.getDate() - d.getDay() + 1); d.setHours(0,0,0,0); return d; })();
@@ -59,6 +122,26 @@ export default function App() {
   const totalSpent = transactions.reduce((s, t) => s + t.amount, 0);
   const spentByCategory = (catId) => transactions.filter((t) => t.categoryId === catId).reduce((s, t) => s + t.amount, 0);
 
+  // Auth handlers
+  const handleSignUp = async () => {
+    setAuthError(""); setAuthMsg("");
+    const { error } = await supabase.auth.signUp({ email: authEmail, password: authPassword });
+    if (error) setAuthError(error.message);
+    else setAuthMsg("Check your email to confirm your account!");
+  };
+
+  const handleLogin = async () => {
+    setAuthError(""); setAuthMsg("");
+    const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+    if (error) setAuthError(error.message);
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    setTransactions([]); setCategories([]); setWeeklyBudget(0); setMonthlyBudget(0);
+  };
+
+  // Account handlers
   const toggleCard = (id) => setOpenId((prev) => (prev === id ? null : id));
   const requestDelete = (e, id) => { e.stopPropagation(); setPendingDeleteId(id); setShowConfirm(true); };
   const confirmDelete = () => {
@@ -78,20 +161,45 @@ export default function App() {
     setEditingId(null);
   };
 
-  const addCategory = () => {
+  // Category handlers
+  const addCategory = async () => {
     if (!newCatName.trim()) return;
-    setCategories((prev) => [...prev, { id: Date.now(), name: newCatName.trim(), budget: 0 }]);
+    const newCat = { id: Date.now(), name: newCatName.trim(), budget: 0 };
+    setCategories((prev) => [...prev, newCat]);
     setNewCatName("");
+    if (session) await supabase.from("categories").insert({ ...newCat, user_id: session.user.id });
   };
-  const updateCatBudget = (id, val) => setCategories((prev) => prev.map((c) => c.id === id ? { ...c, budget: parseFloat(val) || 0 } : c));
-  const deleteCategory = (id) => setCategories((prev) => prev.filter((c) => c.id !== id));
+  const updateCatBudget = async (id, val) => {
+    const budget = parseFloat(val) || 0;
+    setCategories((prev) => prev.map((c) => c.id === id ? { ...c, budget } : c));
+    if (session) await supabase.from("categories").update({ budget }).eq("id", id).eq("user_id", session.user.id);
+  };
+  const deleteCategory = async (id) => {
+    setCategories((prev) => prev.filter((c) => c.id !== id));
+    if (session) await supabase.from("categories").delete().eq("id", id).eq("user_id", session.user.id);
+  };
 
-  const confirmPendingTxs = () => {
+  // Transaction handlers
+  const confirmPendingTxs = async () => {
     setTransactions((prev) => [...prev, ...pendingTxs]);
-    setNextTxId((n) => n + pendingTxs.length);
+    if (session) {
+      await Promise.all(pendingTxs.map((t) =>
+        supabase.from("transactions").insert({
+          id: t.id, description: t.description, amount: t.amount,
+          date: t.date, category_id: t.categoryId, user_id: session.user.id
+        })
+      ));
+    }
     setPendingTxs([]); setShowPending(false);
   };
 
+  const clearAllTransactions = async () => {
+    setTransactions([]);
+    if (session) await supabase.from("transactions").delete().eq("user_id", session.user.id);
+    setShowClearConfirm(false);
+  };
+
+  // Screenshot handler
   const handleScreenshot = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -106,9 +214,13 @@ export default function App() {
       const categoryList = categories.map((c) => `${c.id}: ${c.name}`).join(", ");
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.REACT_APP_ANTHROPIC_KEY,
+          "anthropic-version": "2023-06-01",
+        },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
+          model: "claude-sonnet-4-6",
           max_tokens: 1000,
           messages: [{
             role: "user",
@@ -122,8 +234,7 @@ export default function App() {
       const data = await response.json();
       const text = data.content?.find((b) => b.type === "text")?.text || "[]";
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-      let id = nextTxId;
-      const withIds = parsed.map((t) => ({ ...t, id: id++, categoryId: t.categoryId || categories[categories.length - 1].id }));
+      const withIds = parsed.map((t) => ({ ...t, id: crypto.randomUUID(), categoryId: t.categoryId || categories[categories.length - 1].id }));
       setPendingTxs(withIds);
       setShowPending(true);
     } catch {
@@ -151,14 +262,60 @@ export default function App() {
     progressBar: (pct, over) => ({ height: 8, borderRadius: 99, background: over ? "#ef4444" : "#8b5cf6", width: `${Math.min(pct, 100)}%`, transition: "width 0.4s ease" }),
   };
 
+  // Auth screen
+  if (authLoading) return <div style={{ ...s.page, justifyContent: "center", alignItems: "center" }}><div style={{ fontSize: 16, opacity: 0.5 }}>Loading…</div></div>;
+
+  if (!session) return (
+    <div style={{ ...s.page, alignItems: "center" }}>
+      <div style={{ width: "100%", maxWidth: 380 }}>
+        <div style={{ textAlign: "center", marginBottom: 32 }}>
+          <div style={{ fontSize: 32, fontWeight: 700, letterSpacing: -1 }}>💰 MyBudget</div>
+          <div style={{ fontSize: 13, opacity: 0.5, marginTop: 6 }}>Your personal finance tracker</div>
+        </div>
+        <div style={{ background: "white", borderRadius: 20, padding: 28, boxShadow: "0 20px 60px rgba(0,0,0,0.1)", display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
+            {["login", "signup"].map((m) => (
+              <button key={m} onClick={() => { setAuthMode(m); setAuthError(""); setAuthMsg(""); }} style={{ flex: 1, padding: 10, borderRadius: 12, border: "none", fontWeight: 600, fontSize: 13, cursor: "pointer", background: authMode === m ? "#0f172a" : "#f1f5f9", color: authMode === m ? "white" : "#64748b" }}>
+                {m === "login" ? "Log In" : "Sign Up"}
+              </button>
+            ))}
+          </div>
+          <div>
+            <div style={s.label}>Email</div>
+            <input type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@email.com" style={{ ...s.input, textAlign: "left" }} />
+          </div>
+          <div>
+            <div style={s.label}>Password</div>
+            <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && (authMode === "login" ? handleLogin() : handleSignUp())} placeholder="••••••••" style={{ ...s.input, textAlign: "left" }} />
+          </div>
+          {authError && <div style={{ color: "#ef4444", fontSize: 13 }}>{authError}</div>}
+          {authMsg && <div style={{ color: "#10b981", fontSize: 13 }}>{authMsg}</div>}
+          <button onClick={authMode === "login" ? handleLogin : handleSignUp} style={{ ...s.btnPrimary, padding: 14 }}>
+            {authMode === "login" ? "Log In" : "Create Account"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  if (dbLoading) return <div style={{ ...s.page, justifyContent: "center", alignItems: "center" }}><div style={{ fontSize: 16, opacity: 0.5 }}>Loading your data…</div></div>;
+
   return (
     <div style={s.page}>
       <div style={s.wrap}>
-        <div style={s.tabs}>
-          <button style={s.tab(tab === "accounts")} onClick={() => setTab("accounts")}>💳 Accounts</button>
-          <button style={s.tab(tab === "budget")} onClick={() => setTab("budget")}>📊 Budget Tracker</button>
+        {/* HEADER */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+          <div style={s.tabs}>
+            <button style={s.tab(tab === "accounts")} onClick={() => setTab("accounts")}>💳 Accounts</button>
+            <button style={s.tab(tab === "budget")} onClick={() => setTab("budget")}>📊 Budget Tracker</button>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ fontSize: 13, opacity: 0.5 }}>{session.user.email}</div>
+            <button onClick={handleLogout} style={{ padding: "8px 16px", borderRadius: 10, border: "1px solid #dbe2ea", background: "white", fontSize: 13, cursor: "pointer", fontWeight: 600 }}>Log Out</button>
+          </div>
         </div>
 
+        {/* ACCOUNTS TAB */}
         {tab === "accounts" && (
           <>
             <div style={{ textAlign: "center", marginBottom: 40 }}>
@@ -197,6 +354,7 @@ export default function App() {
           </>
         )}
 
+        {/* BUDGET TAB */}
         {tab === "budget" && (
           <>
             <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
@@ -226,11 +384,11 @@ export default function App() {
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
                     <div>
                       <div style={s.label}>Weekly Budget</div>
-                      <input type="number" value={weeklyBudget || ""} onChange={(e) => setWeeklyBudget(parseFloat(e.target.value) || 0)} placeholder="0.00" style={{ ...s.input, textAlign: "left" }} />
+                      <input type="number" value={weeklyBudget || ""} onChange={(e) => { const v = parseFloat(e.target.value) || 0; setWeeklyBudget(v); syncBudgets(v, monthlyBudget); }} placeholder="0.00" style={{ ...s.input, textAlign: "left" }} />
                     </div>
                     <div>
                       <div style={s.label}>Monthly Budget</div>
-                      <input type="number" value={monthlyBudget || ""} onChange={(e) => setMonthlyBudget(parseFloat(e.target.value) || 0)} placeholder="0.00" style={{ ...s.input, textAlign: "left" }} />
+                      <input type="number" value={monthlyBudget || ""} onChange={(e) => { const v = parseFloat(e.target.value) || 0; setMonthlyBudget(v); syncBudgets(weeklyBudget, v); }} placeholder="0.00" style={{ ...s.input, textAlign: "left" }} />
                     </div>
                   </div>
                 </div>
@@ -304,11 +462,11 @@ export default function App() {
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
                   <div style={{ fontWeight: 700, fontSize: 15 }}>All Transactions ({transactions.length})</div>
                   {transactions.length > 0 && (
-                    <button onClick={() => { if (window.confirm("Clear all transactions?")) setTransactions([]); }} style={{ padding: "6px 12px", borderRadius: 8, border: "none", background: "rgba(239,68,68,0.1)", color: "#ef4444", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Clear All</button>
+                    <button onClick={() => setShowClearConfirm(true)} style={{ padding: "6px 12px", borderRadius: 8, border: "none", background: "rgba(239,68,68,0.1)", color: "#ef4444", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Clear All</button>
                   )}
                 </div>
                 {transactions.length === 0 && <div style={{ opacity: 0.5, fontSize: 13 }}>No transactions yet. Upload a screenshot to get started.</div>}
-                {[...transactions].reverse().map((tx) => {
+                {transactions.map((tx) => {
                   const cat = categories.find((c) => c.id === tx.categoryId);
                   return (
                     <div key={tx.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: "1px solid #f1f5f9" }}>
@@ -326,6 +484,7 @@ export default function App() {
         )}
       </div>
 
+      {/* MODALS */}
       {showAddAccount && (
         <div style={s.overlay}>
           <div style={s.modal}>
@@ -345,10 +504,22 @@ export default function App() {
       {showConfirm && (
         <div style={{ ...s.overlay, zIndex: 200 }}>
           <div style={{ ...s.modal, maxWidth: 320, textAlign: "center" }}>
-            <div style={{ fontSize: 15, lineHeight: 1.5 }}>Are you sure you want to delete this account?</div>
+            <div style={{ fontSize: 15, lineHeight: 1.5 }}>Delete this account?</div>
             <div style={{ display: "flex", gap: 10 }}>
               <button onClick={confirmDelete} style={{ ...s.btnPrimary, background: "#ef4444" }}>Delete</button>
               <button onClick={() => setShowConfirm(false)} style={s.btnSecondary}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showClearConfirm && (
+        <div style={{ ...s.overlay, zIndex: 200 }}>
+          <div style={{ ...s.modal, maxWidth: 320, textAlign: "center" }}>
+            <div style={{ fontSize: 15, lineHeight: 1.5 }}>Clear all transactions? This cannot be undone.</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={clearAllTransactions} style={{ ...s.btnPrimary, background: "#ef4444" }}>Clear All</button>
+              <button onClick={() => setShowClearConfirm(false)} style={s.btnSecondary}>Cancel</button>
             </div>
           </div>
         </div>
